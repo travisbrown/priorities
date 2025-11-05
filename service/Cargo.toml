@@ -1,0 +1,19 @@
+[package]
+name = "priorities-db-service"
+authors = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+clap-verbosity-flag = { version = "3", features = ["tracing"] }
+futures = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+priorities-db = { path = "../db/" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,27 @@
+[package]
+name = "priorities-db-client"
+authors = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+clap-verbosity-flag = { version = "3", features = ["tracing"] }
+futures = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+priorities-db = { path = "../db/" }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
