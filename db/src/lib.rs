@@ -48,18 +48,27 @@ pub trait Format {
     fn decode_priority(value: u64) -> Option<Self::Priority>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct QueueEntry<P> {
+    pub priority: P,
+    pub expiration: Option<DateTime<Utc>>,
+}
+
 pub struct PrioritiesDb<F> {
     db: TransactionDB,
     _format: PhantomData<F>,
 }
 
 impl<F: Format> PrioritiesDb<F> {
+    /// Insert a prioritized ID into the database.
+    ///
+    /// Optionally returns the previous entry for the ID, if there was one.
     pub fn insert(
         &self,
         id: F::Id,
         priority: F::Priority,
         retrieve_previous: bool,
-    ) -> Result<Option<(F::Priority, Option<DateTime<Utc>>)>, Error<F>>
+    ) -> Result<Option<QueueEntry<F::Priority>>, Error<F>>
     where
         F::Priority: Clone,
         F::Id: Clone,
@@ -75,7 +84,14 @@ impl<F: Format> PrioritiesDb<F> {
 
         let transaction = self.db.transaction();
         let previous = if retrieve_previous {
-            Self::lookup_queue_entry(&transaction, queue_cf, lookup_cf, &id, &id_bytes)?
+            let previous =
+                Self::lookup_queue_entry(&transaction, queue_cf, lookup_cf, &id, &id_bytes)?;
+
+            if let Some((queue_key_bytes, _)) = &previous {
+                transaction.delete_cf(queue_cf, queue_key_bytes)?;
+            }
+
+            previous.map(|(_, entry)| entry)
         } else {
             None
         };
@@ -138,7 +154,7 @@ impl<F: Format> PrioritiesDb<F> {
     pub fn cancel_reservations<'a, I: Iterator<Item = &'a F::Id>>(
         &self,
         ids: I,
-    ) -> Result<Vec<Option<(F::Priority, Option<DateTime<Utc>>)>>, Error<F>>
+    ) -> Result<Vec<Option<QueueEntry<F::Priority>>>, Error<F>>
     where
         F::Priority: Clone,
         F::Id: Clone + 'a,
@@ -157,14 +173,11 @@ impl<F: Format> PrioritiesDb<F> {
                     Self::lookup_queue_entry(&transaction, queue_cf, lookup_cf, id, &id_bytes)?;
 
                 // If there is an entry, we clear its reservation.
-                if let Some((priority, _)) = &queue_entry {
-                    let priority_bytes = F::encode_priority(priority).to_be_bytes();
-                    let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, &id_bytes);
-
+                if let Some((queue_key_bytes, _)) = &queue_entry {
                     transaction.put_cf(queue_cf, queue_key_bytes, [])?;
                 }
 
-                Ok(queue_entry)
+                Ok(queue_entry.map(|(_, entry)| entry))
             })
             .collect::<Result<Vec<_>, Error<F>>>()?;
 
@@ -173,12 +186,13 @@ impl<F: Format> PrioritiesDb<F> {
         Ok(queue_entries)
     }
 
-    pub fn complete<'a, I: Iterator<Item = &'a F::Id>>(
+    pub fn complete<'a, I: Iterator<Item = &'a (F::Id, Option<F::Priority>)>>(
         &self,
         ids: I,
-    ) -> Result<Vec<Option<(F::Priority, Option<DateTime<Utc>>)>>, Error<F>>
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<Option<QueueEntry<F::Priority>>>, Error<F>>
     where
-        F::Priority: Clone,
+        F::Priority: Clone + 'a,
         F::Id: Clone + 'a,
     {
         let queue_cf = self.queue_cf();
@@ -187,21 +201,26 @@ impl<F: Format> PrioritiesDb<F> {
         let transaction = self.db.transaction();
 
         let queue_entries = ids
-            .map(|id| {
+            .map(|(id, priority)| {
                 let id_bytes = bincode::encode_to_vec(id, BINCODE_CONFIG)
                     .map_err(|_| Error::InvalidId(id.clone()))?;
 
                 let queue_entry =
                     Self::lookup_queue_entry(&transaction, queue_cf, lookup_cf, id, &id_bytes)?;
 
-                if let Some((priority, _)) = &queue_entry {
-                    let priority_bytes = F::encode_priority(priority).to_be_bytes();
+                if let Some((queue_key_bytes, _)) = &queue_entry {
+                    transaction.delete_cf(queue_cf, queue_key_bytes)?;
+                }
+
+                if let Some(priority) = priority {
+                    let priority_bytes = F::encode_priority(&priority).to_be_bytes();
                     let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, &id_bytes);
 
                     transaction.put_cf(queue_cf, queue_key_bytes, [])?;
+                    transaction.put_cf(lookup_cf, id_bytes, priority_bytes)?;
                 }
 
-                Ok(queue_entry)
+                Ok(queue_entry.map(|(_, entry)| entry))
             })
             .collect::<Result<Vec<_>, Error<F>>>()?;
 
@@ -233,13 +252,16 @@ impl<F: Format> PrioritiesDb<F> {
         }
     }
 
+    /// Look up an entry by ID.
+    ///
+    /// Returns the queue key and entry if one exists.
     fn lookup_queue_entry(
         transaction: &Transaction<TransactionDB>,
         queue_cf: &ColumnFamily,
         lookup_cf: &ColumnFamily,
         id: &F::Id,
         id_bytes: &[u8],
-    ) -> Result<Option<(F::Priority, Option<DateTime<Utc>>)>, Error<F>>
+    ) -> Result<Option<(Vec<u8>, QueueEntry<F::Priority>)>, Error<F>>
     where
         F::Priority: Clone,
         F::Id: Clone,
@@ -250,7 +272,7 @@ impl<F: Format> PrioritiesDb<F> {
                 let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, id_bytes);
 
                 let queue_value_bytes =
-                    transaction.get_pinned_for_update_cf(queue_cf, queue_key_bytes, true)?;
+                    transaction.get_pinned_for_update_cf(queue_cf, &queue_key_bytes, true)?;
 
                 match queue_value_bytes {
                     Some(queue_value_bytes) => {
@@ -265,7 +287,13 @@ impl<F: Format> PrioritiesDb<F> {
                             Some(Self::decode_timestamp(expiration_s)?)
                         };
 
-                        Ok((priority, expiration))
+                        Ok((
+                            queue_key_bytes,
+                            QueueEntry {
+                                priority,
+                                expiration,
+                            },
+                        ))
                     }
                     None => Err(Error::MissingQueueEntry(priority, id.clone())),
                 }
