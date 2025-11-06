@@ -2,7 +2,11 @@
 #![allow(clippy::missing_errors_doc)]
 #![forbid(unsafe_code)]
 use chrono::{DateTime, Utc};
-use rocksdb::{ColumnFamily, IteratorMode, Transaction, TransactionDB};
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, Transaction, TransactionDB,
+    TransactionDBOptions,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::time::Duration;
@@ -24,6 +28,8 @@ pub enum Error<F: Format> {
     RocksDb(#[from] rocksdb::Error),
     #[error("Invalid ID")]
     InvalidId(F::Id),
+    #[error("Invalid priority")]
+    InvalidPriority(F::Priority),
     #[error("Invalid timestamp")]
     InvalidTimestamp(DateTime<Utc>),
     #[error("Invalid timestamp second")]
@@ -36,6 +42,8 @@ pub enum Error<F: Format> {
     InvalidLookupKey(Vec<u8>),
     #[error("Invalid lookup value")]
     InvalidLookupValue(Vec<u8>),
+    #[error("Invalid log key")]
+    InvalidLogKey(Vec<u8>),
     #[error("Missing queue entry")]
     MissingQueueEntry(F::Priority, F::Id),
 }
@@ -44,7 +52,7 @@ pub trait Format {
     type Id: bincode::Encode + bincode::Decode<()>;
     type Priority;
 
-    fn encode_priority(priority: &Self::Priority) -> u64;
+    fn encode_priority(priority: &Self::Priority) -> Option<u64>;
     fn decode_priority(value: u64) -> Option<Self::Priority>;
 }
 
@@ -65,15 +73,17 @@ impl<F: Format> PrioritiesDb<F> {
     /// Optionally returns the previous entry for the ID, if there was one.
     pub fn insert(
         &self,
-        id: F::Id,
-        priority: F::Priority,
+        id: &F::Id,
+        priority: &F::Priority,
         retrieve_previous: bool,
     ) -> Result<Option<QueueEntry<F::Priority>>, Error<F>>
     where
         F::Priority: Clone,
         F::Id: Clone,
     {
-        let priority_bytes = F::encode_priority(&priority).to_be_bytes();
+        let priority_bytes = F::encode_priority(priority)
+            .ok_or_else(|| Error::InvalidPriority(priority.clone()))?
+            .to_be_bytes();
         let id_bytes = bincode::encode_to_vec(&id, BINCODE_CONFIG)
             .map_err(|_| Error::InvalidId(id.clone()))?;
 
@@ -197,6 +207,7 @@ impl<F: Format> PrioritiesDb<F> {
     {
         let queue_cf = self.queue_cf();
         let lookup_cf = self.lookup_cf();
+        let log_cf = self.log_cf();
 
         let transaction = self.db.transaction();
 
@@ -213,11 +224,19 @@ impl<F: Format> PrioritiesDb<F> {
                 }
 
                 if let Some(priority) = priority {
-                    let priority_bytes = F::encode_priority(&priority).to_be_bytes();
+                    let priority_bytes = F::encode_priority(&priority)
+                        .ok_or_else(|| Error::InvalidPriority(priority.clone()))?
+                        .to_be_bytes();
                     let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, &id_bytes);
+
+                    let mut log_key_bytes = Vec::with_capacity(id_bytes.len() + 4);
+                    log_key_bytes[0..id_bytes.len()].copy_from_slice(&id_bytes);
+                    log_key_bytes[id_bytes.len()..id_bytes.len() + 4]
+                        .copy_from_slice(&Self::encode_timestamp_reverse(timestamp)?);
 
                     transaction.put_cf(queue_cf, queue_key_bytes, [])?;
                     transaction.put_cf(lookup_cf, id_bytes, priority_bytes)?;
+                    transaction.put_cf(log_cf, log_key_bytes, [])?;
                 }
 
                 Ok(queue_entry.map(|(_, entry)| entry))
@@ -227,6 +246,44 @@ impl<F: Format> PrioritiesDb<F> {
         transaction.commit()?;
 
         Ok(queue_entries)
+    }
+
+    pub fn id_log(&self, id: &F::Id) -> Result<Vec<DateTime<Utc>>, Error<F>>
+    where
+        F::Id: Clone,
+    {
+        let log_cf = self.log_cf();
+
+        let id_bytes = bincode::encode_to_vec(&id, BINCODE_CONFIG)
+            .map_err(|_| Error::InvalidId(id.clone()))?;
+
+        let mut timestamps = vec![];
+
+        for result in self.db.iterator_cf(
+            log_cf,
+            IteratorMode::From(&id_bytes, rocksdb::Direction::Forward),
+        ) {
+            let (log_key_bytes, _) = result?;
+
+            if log_key_bytes.starts_with(&id_bytes) {
+                if log_key_bytes.len() == id_bytes.len() + 4 {
+                    let timestamp_s = u32::from_be_bytes(
+                        log_key_bytes[id_bytes.len()..id_bytes.len() + 4]
+                            .try_into()
+                            .map_err(|_| Error::InvalidLogKey(log_key_bytes.to_vec()))?,
+                    );
+                    let timestamp = Self::decode_timestamp_reverse(timestamp_s)?;
+
+                    timestamps.push(timestamp);
+                } else {
+                    return Err(Error::InvalidLogKey(log_key_bytes.to_vec()));
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(timestamps)
     }
 
     fn lookup_priority(
@@ -268,7 +325,9 @@ impl<F: Format> PrioritiesDb<F> {
     {
         Self::lookup_priority(transaction, lookup_cf, id_bytes)?
             .map(|priority| {
-                let priority_bytes = F::encode_priority(&priority).to_be_bytes();
+                let priority_bytes = F::encode_priority(&priority)
+                    .ok_or_else(|| Error::InvalidPriority(priority.clone()))?
+                    .to_be_bytes();
                 let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, id_bytes);
 
                 let queue_value_bytes =
@@ -348,7 +407,24 @@ impl<F: Format> PrioritiesDb<F> {
 
 impl<F> PrioritiesDb<F> {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, rocksdb::Error> {
-        todo![]
+        let queue_cf = ColumnFamilyDescriptor::new(QUEUE_CF_NAME, Options::default());
+        let lookup_cf = ColumnFamilyDescriptor::new(LOOKUP_CF_NAME, Options::default());
+        let log_cf = ColumnFamilyDescriptor::new(LOOKUP_CF_NAME, Options::default());
+
+        let cfs = vec![queue_cf, lookup_cf, log_cf];
+
+        let mut options = Options::default();
+        options.create_missing_column_families(true);
+        options.create_if_missing(true);
+
+        let transaction_options = TransactionDBOptions::default();
+
+        let db = TransactionDB::open_cf_descriptors(&options, &transaction_options, path, cfs)?;
+
+        Ok(Self {
+            db,
+            _format: PhantomData,
+        })
     }
 
     fn queue_cf(&self) -> &ColumnFamily {
@@ -367,5 +443,37 @@ impl<F> PrioritiesDb<F> {
         self.db
             .cf_handle(LOG_CF_NAME)
             .expect("Log table column family does not exist")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Format, PrioritiesDb};
+    use chrono::{DateTime, Utc};
+
+    struct U64Id;
+
+    impl Format for U64Id {
+        type Id = u64;
+        type Priority = (u32, DateTime<Utc>);
+
+        fn encode_priority(priority: &Self::Priority) -> Option<u64> {
+            let timestamp_s: u32 = priority.1.timestamp().try_into().ok()?;
+
+            let mut bytes = [0u8; 8];
+            bytes[0..4].copy_from_slice(&priority.0.to_be_bytes());
+            bytes[4..8].copy_from_slice(&timestamp_s.to_be_bytes());
+
+            Some(u64::from_be_bytes(bytes))
+        }
+
+        fn decode_priority(value: u64) -> Option<Self::Priority> {}
+    }
+
+    #[test]
+    fn reserve_next() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_dir = tempfile::tempdir().unwrap();
+
+        Ok(())
     }
 }
