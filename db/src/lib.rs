@@ -23,13 +23,13 @@ const LOOKUP_CF_NAME: &str = "lookup";
 const LOG_CF_NAME: &str = "log";
 
 #[derive(thiserror::Error, Debug)]
-pub enum Error<F: Format> {
+pub enum Error<I, P> {
     #[error("RocksDB error")]
     RocksDb(#[from] rocksdb::Error),
     #[error("Invalid ID")]
-    InvalidId(F::Id),
+    InvalidId(I),
     #[error("Invalid priority")]
-    InvalidPriority(F::Priority),
+    InvalidPriority(P),
     #[error("Invalid timestamp")]
     InvalidTimestamp(DateTime<Utc>),
     #[error("Invalid timestamp second")]
@@ -45,15 +45,12 @@ pub enum Error<F: Format> {
     #[error("Invalid log key")]
     InvalidLogKey(Vec<u8>),
     #[error("Missing queue entry")]
-    MissingQueueEntry(F::Priority, F::Id),
+    MissingQueueEntry(P, I),
 }
 
-pub trait Format {
-    type Id: bincode::Encode + bincode::Decode<()>;
-    type Priority;
-
-    fn encode_priority(priority: &Self::Priority) -> Option<u64>;
-    fn decode_priority(value: u64) -> Option<Self::Priority>;
+pub trait Priority: Sized {
+    fn encode_priority(&self) -> Option<u64>;
+    fn decode_priority(value: u64) -> Option<Self>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -62,26 +59,36 @@ pub struct QueueEntry<P> {
     pub expiration: Option<DateTime<Utc>>,
 }
 
-pub struct PrioritiesDb<F> {
-    db: TransactionDB,
-    _format: PhantomData<F>,
+impl<P> QueueEntry<P> {
+    pub fn new(priority: P, expiration: Option<DateTime<Utc>>) -> Self {
+        Self {
+            priority,
+            expiration,
+        }
+    }
 }
 
-impl<F: Format> PrioritiesDb<F> {
+pub struct PrioritiesDb<I, P> {
+    db: TransactionDB,
+    _format: PhantomData<(I, P)>,
+}
+
+impl<I: bincode::Encode + bincode::Decode<()>, P: Priority> PrioritiesDb<I, P> {
     /// Insert a prioritized ID into the database.
     ///
     /// Optionally returns the previous entry for the ID, if there was one.
     pub fn insert(
         &self,
-        id: &F::Id,
-        priority: &F::Priority,
+        id: &I,
+        priority: &P,
         retrieve_previous: bool,
-    ) -> Result<Option<QueueEntry<F::Priority>>, Error<F>>
+    ) -> Result<Option<QueueEntry<P>>, Error<I, P>>
     where
-        F::Priority: Clone,
-        F::Id: Clone,
+        I: Clone,
+        P: Clone,
     {
-        let priority_bytes = F::encode_priority(priority)
+        let priority_bytes = priority
+            .encode_priority()
             .ok_or_else(|| Error::InvalidPriority(priority.clone()))?
             .to_be_bytes();
         let id_bytes = bincode::encode_to_vec(&id, BINCODE_CONFIG)
@@ -118,7 +125,7 @@ impl<F: Format> PrioritiesDb<F> {
         count: usize,
         reservation: Duration,
         now: DateTime<Utc>,
-    ) -> Result<Vec<F::Id>, Error<F>> {
+    ) -> Result<Vec<I>, Error<I, P>> {
         let expiration = now + reservation;
         let expiration_bytes = Self::encode_timestamp(expiration)?;
         let queue_cf = self.queue_cf();
@@ -132,17 +139,20 @@ impl<F: Format> PrioritiesDb<F> {
             let timestamp = Self::decode_queue_value(value_bytes)?;
 
             if timestamp.is_none_or(|timestamp| timestamp <= now) {
-                if key_bytes.len() < 4 {
+                if key_bytes.len() < 8 {
                     return Err(Error::InvalidQueueKey(key_bytes.to_vec()));
                 }
 
-                let id_bytes = &key_bytes[4..];
+                let id_bytes = &key_bytes[8..];
 
-                let (id, remaining_len) =
-                    bincode::decode_from_slice::<F::Id, _>(id_bytes, BINCODE_CONFIG)
-                        .map_err(|_| Error::InvalidQueueKey(key_bytes.to_vec()))?;
+                if id_bytes.len() != 8 {
+                    return Err(Error::InvalidQueueKey(key_bytes.to_vec()));
+                }
 
-                if remaining_len != 0 {
+                let (id, read) = bincode::decode_from_slice::<I, _>(id_bytes, BINCODE_CONFIG)
+                    .map_err(|_| Error::InvalidQueueKey(key_bytes.to_vec()))?;
+
+                if read != 8 {
                     return Err(Error::InvalidQueueKey(key_bytes.to_vec()));
                 }
 
@@ -161,13 +171,13 @@ impl<F: Format> PrioritiesDb<F> {
         Ok(ids)
     }
 
-    pub fn cancel_reservations<'a, I: Iterator<Item = &'a F::Id>>(
+    pub fn cancel_reservations<'a, IS: Iterator<Item = &'a I>>(
         &self,
-        ids: I,
-    ) -> Result<Vec<Option<QueueEntry<F::Priority>>>, Error<F>>
+        ids: IS,
+    ) -> Result<Vec<Option<QueueEntry<P>>>, Error<I, P>>
     where
-        F::Priority: Clone,
-        F::Id: Clone + 'a,
+        I: Clone + 'a,
+        P: Clone,
     {
         let queue_cf = self.queue_cf();
         let lookup_cf = self.lookup_cf();
@@ -189,21 +199,21 @@ impl<F: Format> PrioritiesDb<F> {
 
                 Ok(queue_entry.map(|(_, entry)| entry))
             })
-            .collect::<Result<Vec<_>, Error<F>>>()?;
+            .collect::<Result<Vec<_>, Error<I, P>>>()?;
 
         transaction.commit()?;
 
         Ok(queue_entries)
     }
 
-    pub fn complete<'a, I: Iterator<Item = &'a (F::Id, Option<F::Priority>)>>(
+    pub fn complete<'a, IS: Iterator<Item = &'a (I, Option<P>)>>(
         &self,
-        ids: I,
+        ids: IS,
         timestamp: DateTime<Utc>,
-    ) -> Result<Vec<Option<QueueEntry<F::Priority>>>, Error<F>>
+    ) -> Result<Vec<Option<QueueEntry<P>>>, Error<I, P>>
     where
-        F::Priority: Clone + 'a,
-        F::Id: Clone + 'a,
+        I: Clone + 'a,
+        P: Clone + 'a,
     {
         let queue_cf = self.queue_cf();
         let lookup_cf = self.lookup_cf();
@@ -224,15 +234,15 @@ impl<F: Format> PrioritiesDb<F> {
                 }
 
                 if let Some(priority) = priority {
-                    let priority_bytes = F::encode_priority(&priority)
+                    let priority_bytes = priority
+                        .encode_priority()
                         .ok_or_else(|| Error::InvalidPriority(priority.clone()))?
                         .to_be_bytes();
                     let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, &id_bytes);
 
                     let mut log_key_bytes = Vec::with_capacity(id_bytes.len() + 4);
-                    log_key_bytes[0..id_bytes.len()].copy_from_slice(&id_bytes);
-                    log_key_bytes[id_bytes.len()..id_bytes.len() + 4]
-                        .copy_from_slice(&Self::encode_timestamp_reverse(timestamp)?);
+                    log_key_bytes.extend(&id_bytes);
+                    log_key_bytes.extend(&Self::encode_timestamp_reverse(timestamp)?);
 
                     transaction.put_cf(queue_cf, queue_key_bytes, [])?;
                     transaction.put_cf(lookup_cf, id_bytes, priority_bytes)?;
@@ -241,16 +251,16 @@ impl<F: Format> PrioritiesDb<F> {
 
                 Ok(queue_entry.map(|(_, entry)| entry))
             })
-            .collect::<Result<Vec<_>, Error<F>>>()?;
+            .collect::<Result<Vec<_>, Error<I, P>>>()?;
 
         transaction.commit()?;
 
         Ok(queue_entries)
     }
 
-    pub fn id_log(&self, id: &F::Id) -> Result<Vec<DateTime<Utc>>, Error<F>>
+    pub fn id_log(&self, id: &I) -> Result<Vec<DateTime<Utc>>, Error<I, P>>
     where
-        F::Id: Clone,
+        I: Clone,
     {
         let log_cf = self.log_cf();
 
@@ -290,7 +300,7 @@ impl<F: Format> PrioritiesDb<F> {
         transaction: &Transaction<TransactionDB>,
         lookup_cf: &ColumnFamily,
         id_bytes: &[u8],
-    ) -> Result<Option<F::Priority>, Error<F>> {
+    ) -> Result<Option<P>, Error<I, P>> {
         match transaction.get_pinned_for_update_cf(lookup_cf, id_bytes, true)? {
             Some(lookup_value_bytes) => {
                 let priority_value = u64::from_be_bytes(
@@ -300,7 +310,7 @@ impl<F: Format> PrioritiesDb<F> {
                         .map_err(|_| Error::InvalidLookupValue(lookup_value_bytes.to_vec()))?,
                 );
 
-                let priority = F::decode_priority(priority_value)
+                let priority = P::decode_priority(priority_value)
                     .ok_or_else(|| Error::InvalidLookupValue(lookup_value_bytes.to_vec()))?;
 
                 Ok(Some(priority))
@@ -316,16 +326,17 @@ impl<F: Format> PrioritiesDb<F> {
         transaction: &Transaction<TransactionDB>,
         queue_cf: &ColumnFamily,
         lookup_cf: &ColumnFamily,
-        id: &F::Id,
+        id: &I,
         id_bytes: &[u8],
-    ) -> Result<Option<(Vec<u8>, QueueEntry<F::Priority>)>, Error<F>>
+    ) -> Result<Option<(Vec<u8>, QueueEntry<P>)>, Error<I, P>>
     where
-        F::Priority: Clone,
-        F::Id: Clone,
+        P: Clone,
+        I: Clone,
     {
         Self::lookup_priority(transaction, lookup_cf, id_bytes)?
             .map(|priority| {
-                let priority_bytes = F::encode_priority(&priority)
+                let priority_bytes = priority
+                    .encode_priority()
                     .ok_or_else(|| Error::InvalidPriority(priority.clone()))?
                     .to_be_bytes();
                 let queue_key_bytes = Self::queue_key_bytes(&priority_bytes, id_bytes);
@@ -362,34 +373,33 @@ impl<F: Format> PrioritiesDb<F> {
 
     fn queue_key_bytes(priority_bytes: &[u8], id_bytes: &[u8]) -> Vec<u8> {
         let mut queue_key_bytes = Vec::with_capacity(8 + id_bytes.len());
-        queue_key_bytes[0..8].copy_from_slice(priority_bytes);
-        queue_key_bytes[8..].copy_from_slice(id_bytes);
-
+        queue_key_bytes.extend(priority_bytes);
+        queue_key_bytes.extend(id_bytes);
         queue_key_bytes
     }
 
-    fn encode_timestamp(timestamp: DateTime<Utc>) -> Result<[u8; 4], Error<F>> {
+    fn encode_timestamp(timestamp: DateTime<Utc>) -> Result<[u8; 4], Error<I, P>> {
         u32::try_from(timestamp.timestamp())
             .map(u32::to_be_bytes)
             .map_err(|_| Error::InvalidTimestamp(timestamp))
     }
 
-    fn decode_timestamp(timestamp_s: u32) -> Result<DateTime<Utc>, Error<F>> {
+    fn decode_timestamp(timestamp_s: u32) -> Result<DateTime<Utc>, Error<I, P>> {
         DateTime::from_timestamp(timestamp_s.into(), 0)
             .ok_or_else(|| Error::InvalidTimestampSecond(timestamp_s))
     }
 
-    fn encode_timestamp_reverse(timestamp: DateTime<Utc>) -> Result<[u8; 4], Error<F>> {
+    fn encode_timestamp_reverse(timestamp: DateTime<Utc>) -> Result<[u8; 4], Error<I, P>> {
         u32::try_from(timestamp.timestamp())
             .map(|timestamp_s| (u32::MAX - timestamp_s).to_be_bytes())
             .map_err(|_| Error::InvalidTimestamp(timestamp))
     }
 
-    fn decode_timestamp_reverse(timestamp_s: u32) -> Result<DateTime<Utc>, Error<F>> {
+    fn decode_timestamp_reverse(timestamp_s: u32) -> Result<DateTime<Utc>, Error<I, P>> {
         Self::decode_timestamp(u32::MAX - timestamp_s)
     }
 
-    fn decode_queue_value<B: AsRef<[u8]>>(bytes: B) -> Result<Option<DateTime<Utc>>, Error<F>> {
+    fn decode_queue_value<B: AsRef<[u8]>>(bytes: B) -> Result<Option<DateTime<Utc>>, Error<I, P>> {
         if bytes.as_ref().is_empty() {
             Ok(None)
         } else {
@@ -405,8 +415,8 @@ impl<F: Format> PrioritiesDb<F> {
     }
 }
 
-impl<F> PrioritiesDb<F> {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, rocksdb::Error> {
+impl<I, P> PrioritiesDb<I, P> {
+    pub fn open<D: AsRef<Path>>(directory: D) -> Result<Self, rocksdb::Error> {
         let queue_cf = ColumnFamilyDescriptor::new(QUEUE_CF_NAME, Options::default());
         let lookup_cf = ColumnFamilyDescriptor::new(LOOKUP_CF_NAME, Options::default());
         let log_cf = ColumnFamilyDescriptor::new(LOOKUP_CF_NAME, Options::default());
@@ -419,7 +429,8 @@ impl<F> PrioritiesDb<F> {
 
         let transaction_options = TransactionDBOptions::default();
 
-        let db = TransactionDB::open_cf_descriptors(&options, &transaction_options, path, cfs)?;
+        let db =
+            TransactionDB::open_cf_descriptors(&options, &transaction_options, directory, cfs)?;
 
         Ok(Self {
             db,
@@ -448,31 +459,78 @@ impl<F> PrioritiesDb<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Format, PrioritiesDb};
-    use chrono::{DateTime, Utc};
+    use super::{PrioritiesDb, Priority, QueueEntry};
+    use chrono::{DateTime, SubsecRound, Utc};
+    use std::time::Duration;
 
-    struct U64Id;
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct CodeTimestamp {
+        code: u32,
+        timestamp: DateTime<Utc>,
+    }
 
-    impl Format for U64Id {
-        type Id = u64;
-        type Priority = (u32, DateTime<Utc>);
+    impl CodeTimestamp {
+        fn new(code: u32, timestamp: DateTime<Utc>) -> Self {
+            Self {
+                code,
+                timestamp: timestamp.round_subsecs(0),
+            }
+        }
+    }
 
-        fn encode_priority(priority: &Self::Priority) -> Option<u64> {
-            let timestamp_s: u32 = priority.1.timestamp().try_into().ok()?;
+    impl Priority for CodeTimestamp {
+        fn encode_priority(&self) -> Option<u64> {
+            let timestamp_s: u32 = self.timestamp.timestamp().try_into().ok()?;
 
             let mut bytes = [0u8; 8];
-            bytes[0..4].copy_from_slice(&priority.0.to_be_bytes());
+            bytes[0..4].copy_from_slice(&self.code.to_be_bytes());
             bytes[4..8].copy_from_slice(&timestamp_s.to_be_bytes());
 
             Some(u64::from_be_bytes(bytes))
         }
 
-        fn decode_priority(value: u64) -> Option<Self::Priority> {}
+        fn decode_priority(value: u64) -> Option<Self> {
+            let bytes = value.to_be_bytes();
+            let code_bytes: [u8; 4] = bytes[0..4].try_into().ok()?;
+            let timestamp_bytes: [u8; 4] = bytes[4..8].try_into().ok()?;
+            let timestamp =
+                DateTime::from_timestamp(u32::from_be_bytes(timestamp_bytes).into(), 0)?;
+
+            Some(Self {
+                code: u32::from_be_bytes(code_bytes),
+                timestamp,
+            })
+        }
     }
 
     #[test]
     fn reserve_next() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_dir = tempfile::tempdir().unwrap();
+
+        let db: PrioritiesDb<u64, CodeTimestamp> = PrioritiesDb::open(test_db_dir)?;
+        let now = Utc::now();
+        let timestamp_a = now + chrono::Duration::seconds(10);
+        let timestamp_b = now + chrono::Duration::seconds(20);
+
+        let priority_0 = CodeTimestamp::new(0, timestamp_a);
+        let priority_1 = CodeTimestamp::new(0, timestamp_b);
+        let priority_2 = CodeTimestamp::new(1, timestamp_a);
+
+        let previous = db.insert(&987, &priority_0, true)?;
+        assert_eq!(previous, None);
+
+        let previous = db.insert(&123, &priority_0, true)?;
+        assert_eq!(previous, None);
+
+        let previous = db.insert(&123, &priority_1, true)?;
+        assert_eq!(previous, Some(QueueEntry::new(priority_0, None)));
+
+        let previous = db.insert(&456, &priority_2, true)?;
+        assert_eq!(previous, None);
+
+        let next = db.reserve_next(10, Duration::from_secs(30), now)?;
+
+        assert_eq!(next, vec![987, 123, 456]);
 
         Ok(())
     }
